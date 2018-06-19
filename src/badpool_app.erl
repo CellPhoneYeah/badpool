@@ -11,7 +11,7 @@ start(_, _) ->
     io:format("start server"),
     SupOpts = [
                {name, mypool},
-               {call_back_mod, badpool_test}
+               {call_back_mod, test_worker}
               ],
     WorkerOpts = [],
     badpool_server:start_link(SupOpts, WorkerOpts).

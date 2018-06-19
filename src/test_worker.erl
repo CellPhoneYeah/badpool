@@ -16,12 +16,14 @@
          code_change/3
         ]).
 
+-record(state, {}).
+
 start_link(WorkerOpts) ->
     gen_server:start_link(?MODULE, [WorkerOpts], []).
 
 init(WorkerOpts) ->
     io:format("start a woker ~p ~n", [WorkerOpts]),
-    {ok, {}}.
+    {ok, #state{}}.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.

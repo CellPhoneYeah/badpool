@@ -8,6 +8,7 @@ start() ->
     case application:start(badpool) of
         ok ->
             io:format("app start~n");
-        Other ->
-            io:format("Other ~p~n", [Other])
+        _Other ->
+            %% io:format("Other ~p~n", [Other])
+            ok
     end.

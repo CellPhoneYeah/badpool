@@ -13,15 +13,15 @@ start_link(CallBackMod, Args) ->
 init([CallBackMod, Args]) ->
     SupFlag = #{
       strategy => simple_one_for_one,
-      infinity => 10,
-      period => 10
+      intensity => 0,
+      period => 1
      },
     ChildSpec = #{
       id => CallBackMod,
       start => {CallBackMod, start_link, [Args]},
-      restart => temperary,
+      restart => temporary,
       shutdown => 5000,
       type => worker,
       modules => [CallBackMod]
      },
-    {ok, {SupFlag, ChildSpec}}.
+    {ok, {SupFlag, [ChildSpec]}}.
