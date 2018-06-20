@@ -37,7 +37,7 @@
 -define(IDLE, 0). %% 空闲
 -define(BUSY, 1). %% 忙碌
 
--define(TIMEOUT, 5000). %% 请求工作进程超时时间
+-define(TIMEOUT, 50000). %% 请求工作进程超时时间
 %%% ===========================
 %%% API
 %%% ===========================
@@ -46,7 +46,7 @@ start_link(SupOpts, WorkerOpts) ->
         undefined ->
             not_set_name;
         Name ->
-            gen_server:start_link(Name, ?MODULE, {SupOpts, WorkerOpts}, [])
+            gen_server:start_link({local, Name}, ?MODULE, {SupOpts, WorkerOpts}, [])
     end.
 
 check_out(Name) ->
@@ -54,6 +54,7 @@ check_out(Name) ->
         gen_server:call(Name, {check_out}, ?TIMEOUT)
     catch
         Class:Reason ->
+            io:format("cancel wait ~p~n", [self()]),
             gen_server:cast(Name, {cancel_wait, self()}),
             erlang:raise(Class, Reason, erlang:get_stacktrace())
     end.
@@ -62,7 +63,7 @@ check_in(Name, Pid) ->
     gen_server:cast(Name, {check_in, Pid}).
 
 workers(Name) ->
-    ets:lookup_element(?ETS_BADPOOL, {all_workers, Name}, 2).
+    ets:lookup_element(?ETS_BADPOOL, {workers, Name}, 2).
 
 stop(Name) ->
     gen_server:terminate(Name).
@@ -77,18 +78,19 @@ init({SupOpts, WorkerOpts}) ->
     ets:new(ets_badpool, [public, set, named_table]),
     init(SupOpts, #state{monitors = Monitor, waiting = Waiting, worker_opts = WorkerOpts}).
 
-handle_call({check_out, Name}, {FromPid, _}, State) ->
-    #state{monitors = Monitors, waiting = Waiting} = State,
-    case ets:lookup_element(?ETS_BADPOOL, {workers, Name}) of
+handle_call({check_out}, {FromPid, _} = From, State) ->
+    #state{monitors = Monitors, waiting = Waiting, name = Name} = State,
+    Monitor = monitor(process, FromPid),
+    case workers(Name) of
         [] ->
-            NewWaiting = [FromPid | Waiting],
+            NewWaiting = queue:in({From, Monitor}, Waiting),
             {noreply, State#state{waiting = NewWaiting}};
-        [Pid | _Left] ->
-            Monitor = erlang:monitor(process, FromPid),
-            ets:delete(?ETS_BADPOOL, Pid),
-            {reply, Pid, State#state{monitors = [Monitor | Monitors]}}
+        [Pid | Left] ->
+            ets:insert(?ETS_BADPOOL, {{workers, Name}, Left}),
+            {reply, Pid, State#state{monitors = [{Pid, From, Monitor} | Monitors]}}
     end;
 handle_call(_Request, _From, State) ->
+    io:format("request ~p, from ~p~n", [_Request, _From]),
     {reply, bad_request, State}.
 
 handle_cast(Request, State) ->
@@ -117,22 +119,44 @@ code_change(_Ovsn, State, _Extra) ->
 %%% internal
 %%% ============================
 do_handle_cast({check_in, Pid}, State) ->
-    #state{waiting = Waiting, name = Name} = State,
-    case queue:out(Waiting) of
-        {{value, WaitPid}, Left} ->
-            gen_server:reply(WaitPid, Pid),
-            {ok, State#state{waiting = Left}};
-        {empty, _} ->
-            ets:insert(ets_badpool, {workers, Name})
-    end;
-do_handle_cast({cancel_wait, Pid}, State) ->
-    #state{waiting = Waiting} = State,
-    case queue:out(Waiting) of
-        {{value, Pid}, Left} ->
-            {ok, State#state{waiting = Left}};
-        {empty, _} ->
+    io:format("check in 1"),
+    #state{waiting = Waiting, name = Name, monitors = Monitors} = State,
+    case lists:keytake(Pid, 1, Monitors) of
+        {value, {Pid, _From, Monitor}, LeftMonitors} ->
+            io:format("check in 2"),
+            demonitor(Monitor),
+            case queue:out(Waiting) of
+                {{value, {From, WaitMonitor}}, Left} ->
+                    io:format("check in 3"),
+                    NewMonitors = [{Pid, From, WaitMonitor} | LeftMonitors],
+                    gen_server:reply(From, Pid),
+                    {ok, State#state{waiting = Left, monitors = NewMonitors}};
+                {empty, _} ->
+                    io:format("check in 4"),
+                    Workers = workers(Name),
+                    ets:insert(?ETS_BADPOOL, {{workers, Name}, [Pid | Workers]}),
+                    {ok, State#state{monitors = LeftMonitors}};
+                Other ->
+                    io:format("check in 5 ~p~n", [Other]),
+                    {ok, State}
+            end;
+        false ->
+            io:format("not find monitor"),
             {ok, State}
     end;
+    
+do_handle_cast({cancel_wait, FromPid}, State) ->
+    #state{waiting = Waiting} = State,
+    F = fun({{FPid, _}, Monitor}) when FromPid =:= FPid ->
+                demonitor(Monitor),
+                false;
+           (_) ->
+                true
+        end,
+    io:format("waiting ~p~n", [Waiting]),
+    NewWaiting = queue:filter(F, Waiting),
+    io:format("new waiting ~p~n", [NewWaiting]),
+    {ok, State#state{waiting = NewWaiting}};
 do_handle_cast(_Request, State) ->
     {ok, State}.
 
