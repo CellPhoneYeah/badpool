@@ -6,10 +6,14 @@
          check_out/0,
          out_all/0,
          in_one/0,
-         get_data/0
+         get_data/0,
+         stop/0
         ]).
 
 -define(CHECK_OUT, check_out_num).
+
+stop() ->
+    badpool_server:stop(mypool).
 
 all() ->
     badpool_server:workers(mypool).

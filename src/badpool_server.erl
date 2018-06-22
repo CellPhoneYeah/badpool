@@ -12,23 +12,22 @@
         ]).
 
 -export([
-         start_link/2,
-         workers/1,
-         check_in/2,
-         check_out/1,
-         stop/1
+         start_link/2, %% 开始进程池
+         workers/1, %% 所有工作进程
+         check_in/2, %% 回收一条工作进程
+         check_out/1, %% 获取一条工作进程
+         stop/1 %% 停止进程池
         ]).
 
 
 -define(MAX_PROCESS_NUM, 10).
 
 -record(state, {
-          name = {local, badpool_server},
+          name = mypool,
           max_process_num = ?MAX_PROCESS_NUM, %% 最大进程数量
           call_back_mod, %% 回调模块
           worker_opts = [], %% 工作进程的启动参数
           sup_pid,  %% 监视进程pid
-          workers = [], %% 所有工作进程
           waiting, %% 等待中的使用者
           monitors   %% 正在使用工作进程的进程监控，如果进程使用者死了，则回收进程
          }).
@@ -37,14 +36,15 @@
 -define(IDLE, 0). %% 空闲
 -define(BUSY, 1). %% 忙碌
 
--define(TIMEOUT, 50000). %% 请求工作进程超时时间
+-define(TIMEOUT, 5000). %% 请求工作进程超时时间
+-define(PROCESS_NAME, process_name).
 %%% ===========================
 %%% API
 %%% ===========================
 start_link(SupOpts, WorkerOpts) ->
     case proplists:get_value(name, SupOpts) of
         undefined ->
-            not_set_name;
+            throw({error, not_set_name}); %% 抛出异常，让启动失败
         Name ->
             gen_server:start_link({local, Name}, ?MODULE, {SupOpts, WorkerOpts}, [])
     end.
@@ -66,7 +66,7 @@ workers(Name) ->
     ets:lookup_element(?ETS_BADPOOL, {workers, Name}, 2).
 
 stop(Name) ->
-    gen_server:terminate(Name).
+    gen_server:stop(Name).
 
 %%% ============================
 %%% callback
@@ -74,12 +74,13 @@ stop(Name) ->
 init({SupOpts, WorkerOpts}) ->
     process_flag(trap_exit, true),
     Monitor = ets:new(monitors, [private]),
+    Name = proplists:get_value(name, SupOpts),
     Waiting = queue:new(),
-    ets:new(ets_badpool, [public, set, named_table]),
-    init(SupOpts, #state{monitors = Monitor, waiting = Waiting, worker_opts = WorkerOpts}).
+    ?ETS_BADPOOL = ets:new(?ETS_BADPOOL, [public, set, named_table]),
+    init(SupOpts, #state{name = Name, monitors = Monitor, waiting = Waiting, worker_opts = WorkerOpts}).
 
 handle_call({check_out}, {FromPid, _} = From, State) ->
-    #state{monitors = Monitors, waiting = Waiting, name = Name} = State,
+    #state{name = Name, monitors = Monitors, waiting = Waiting} = State,
     Monitor = monitor(process, FromPid),
     case workers(Name) of
         [] ->
@@ -109,7 +110,12 @@ handle_info(Request, State) ->
             {noreply, State}
     end.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    #state{name = Name, monitors = Monitors, waiting = Waiting} = State,
+    Workers = workers(Name),
+    [exit(Pid) || {Pid, _} <- Workers],
+    [exit(MPid) || {MPid, _, _} <- Monitors],
+    stop_wait(Waiting),
     ok.
 
 code_change(_Ovsn, State, _Extra) ->
@@ -120,7 +126,7 @@ code_change(_Ovsn, State, _Extra) ->
 %%% ============================
 do_handle_cast({check_in, Pid}, State) ->
     io:format("check in 1"),
-    #state{waiting = Waiting, name = Name, monitors = Monitors} = State,
+    #state{name = Name, waiting = Waiting, monitors = Monitors} = State,
     case lists:keytake(Pid, 1, Monitors) of
         {value, {Pid, _From, Monitor}, LeftMonitors} ->
             io:format("check in 2"),
@@ -175,19 +181,27 @@ start_workers(SupPid, ProcessNum, Workers) ->
 
 
 
-init([{name, Name} | Left], State) ->
-    init(Left, State#state{name = Name});
 init([{call_back_mod, Mod} | Left], State) ->
     init(Left, State#state{call_back_mod = Mod});
 init([{max_process_num, MaxProcessNum} | Left], State) ->
     init(Left, State#state{max_process_num = MaxProcessNum});
 init([_Other | Left], State) ->
     init(Left, State);
-init([], State = #state{name = Name, call_back_mod = CallBackMod, max_process_num = MaxProcessNum, worker_opts = WorkerOpts})
+init([], State = #state{name =Name, call_back_mod = CallBackMod, max_process_num = MaxProcessNum, worker_opts = WorkerOpts})
   when CallBackMod /= undefined andalso MaxProcessNum > 0 ->
     {ok, SupPid} = badpool_sup:start_link(CallBackMod, WorkerOpts),
     Workers = start_workers(SupPid, MaxProcessNum),
-    ets:insert(ets_badpool, {{workers, Name}, Workers}),
+    ets:insert(?ETS_BADPOOL, {{workers, Name}, Workers}),
     NewState = State#state{sup_pid = SupPid},
     {ok, NewState}.
 
+stop_wait(empty) ->
+    ok;
+stop_wait(Waiting) ->
+    case queue:out(Waiting) of
+        {{value, {_, Monitor}}, Left} ->
+            demonitor(Monitor),
+            stop_wait(Left);
+        _ ->
+            ok
+    end.
