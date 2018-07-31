@@ -38,6 +38,21 @@
 
 -define(TIMEOUT, 5000). %% 请求工作进程超时时间
 -define(PROCESS_NAME, process_name).
+
+-define(ETS_MONITORS, monitors).
+
+-record(check_outed,
+        {pid = undefined, % 工作进程id
+         from = undefined, % 使用的进程信息
+         monitor = undefined %% 监控进程
+        }). 
+
+-record(wait,
+        {
+         from = undefined, % 等待进程信息
+         monitor = undefined % 监控进程
+        }).
+
 %%% ===========================
 %%% API
 %%% ===========================
@@ -73,7 +88,7 @@ stop(Name) ->
 %%% ============================
 init({SupOpts, WorkerOpts}) ->
     process_flag(trap_exit, true),
-    Monitor = ets:new(monitors, [private]),
+    Monitor = ets:new(?ETS_MONITORS, [private]),
     Name = proplists:get_value(name, SupOpts),
     Waiting = queue:new(),
     ?ETS_BADPOOL = ets:new(?ETS_BADPOOL, [public, set, named_table]),
@@ -113,9 +128,9 @@ handle_info(Request, State) ->
 terminate(_Reason, State) ->
     #state{name = Name, monitors = Monitors, waiting = Waiting} = State,
     Workers = workers(Name),
+    stop_wait(Waiting),
     [exit(Pid) || {Pid, _} <- Workers],
     [exit(MPid) || {MPid, _, _} <- Monitors],
-    stop_wait(Waiting),
     ok.
 
 code_change(_Ovsn, State, _Extra) ->
@@ -124,50 +139,82 @@ code_change(_Ovsn, State, _Extra) ->
 %%% ============================
 %%% internal
 %%% ============================
-do_handle_cast({check_in, Pid}, State) ->
-    io:format("check in 1"),
+add_worker(Pid, State) ->
     #state{name = Name, waiting = Waiting, monitors = Monitors} = State,
+    case queue:out(Waiting) of
+        {{value, #wait{from = From, monitor = WaitMonitor}}, Left} ->
+            NewCheckout = #check_outed{pid = Pid, from = From, monitor = WaitMonitor},
+            gen_server:reply(From, Pid),
+            {ok, State#state{waiting = Left, monitors = [NewCheckout | Monitors]}};
+        {empty, _} ->
+            Workers = workers(Name),
+            ets:insert(?ETS_BADPOOL, {{workers, Name}, [Pid | Workers]}),
+            {ok, State}
+    end.
+
+do_handle_cast({check_in, Pid}, State) ->
+    #state{monitors = Monitors} = State,
     case lists:keytake(Pid, 1, Monitors) of
-        {value, {Pid, _From, Monitor}, LeftMonitors} ->
-            io:format("check in 2"),
+        {value, #check_outed{pid = Pid, monitor = Monitor}, LeftMonitors} ->
             demonitor(Monitor),
-            case queue:out(Waiting) of
-                {{value, {From, WaitMonitor}}, Left} ->
-                    io:format("check in 3"),
-                    NewMonitors = [{Pid, From, WaitMonitor} | LeftMonitors],
-                    gen_server:reply(From, Pid),
-                    {ok, State#state{waiting = Left, monitors = NewMonitors}};
-                {empty, _} ->
-                    io:format("check in 4"),
-                    Workers = workers(Name),
-                    ets:insert(?ETS_BADPOOL, {{workers, Name}, [Pid | Workers]}),
-                    {ok, State#state{monitors = LeftMonitors}};
-                Other ->
-                    io:format("check in 5 ~p~n", [Other]),
-                    {ok, State}
-            end;
+            add_worker(Pid, State#state{monitors = LeftMonitors});
         false ->
-            io:format("not find monitor"),
+            io:format("not find monitor~n"),
             {ok, State}
     end;
-    
+
 do_handle_cast({cancel_wait, FromPid}, State) ->
     #state{waiting = Waiting} = State,
-    F = fun({{FPid, _}, Monitor}) when FromPid =:= FPid ->
+    F = fun(#wait{from = {FPid, _}, monitor = Monitor}) when FromPid =:= FPid ->
                 demonitor(Monitor),
                 false;
            (_) ->
                 true
         end,
-    io:format("waiting ~p~n", [Waiting]),
     NewWaiting = queue:filter(F, Waiting),
     io:format("new waiting ~p~n", [NewWaiting]),
     {ok, State#state{waiting = NewWaiting}};
 do_handle_cast(_Request, State) ->
     {ok, State}.
 
+% link的进程死掉，也就是工作进程死了，需要重新开一个新的工作进程
+do_handle_info({'EXIT', {Pid, _} = From, Reason}, State) ->
+    #state{monitors = Monitors, sup_pid = SupPid} = State,
+    case lists:keytake(From, #check_outed.pid, Monitors) of
+        {value, #check_outed{pid = Pid, monitor = Monitor}, LeftMonitors} ->
+            demonitor(Monitor),
+            {ok, NewWorkerPid} = supervisor:start_link(SupPid, []),
+            add_worker(NewWorkerPid, State#state{monitors = LeftMonitors});
+        {empty, _} ->
+            io:format("a worker down pid ~w reason ~w~n", [Pid, Reason])
+    end;
+% monitor的进程死掉，也就是调用工作进程的调用进程死了
+do_handle_info({'DOWN', From, Reason}, State) ->
+    {ok, NewState} = do_check_in(From, State),
+    io:format("a caller down from ~w reason ~w~n", [From, Reason]),
+    {ok, NewState};
 do_handle_info(_Request, State) ->
     {ok, State}.
+
+
+do_check_in(Pid, State) when is_pid(Pid) ->
+    #state{monitors = Monitors} = State,
+    case lists:keytake(Pid, 1, Monitors) of
+        {value, {Pid, _From, Monitor}, LeftMonitors} ->
+            demonitor(Monitor),
+            add_worker(Pid, State#state{monitors = LeftMonitors});
+        false ->
+            io:format("not find monitor"),
+            {ok, State}
+    end;
+do_check_in(From, State) ->
+    #state{monitors = Monitors} = State,
+    case lists:keytake(From, #check_outed.from, Monitors) of
+        {value, #check_outed{pid = Pid}, _LeftMonitors} ->
+            do_check_in(Pid, State);
+        false ->
+            ok
+    end.
 
 start_workers(SupPid, ProcessNum) ->
     start_workers(SupPid, ProcessNum, []).
@@ -177,9 +224,7 @@ start_workers(_SupPid, 0, Workers) ->
 start_workers(SupPid, ProcessNum, Workers) ->
     {ok, Pid} = supervisor:start_child(SupPid, []),
     true = link(Pid),
-    start_workers(SupPid, ProcessNum - 1, [{Pid, ?IDLE} | Workers]).
-
-
+    start_workers(SupPid, ProcessNum - 1, [Pid | Workers]).
 
 init([{call_back_mod, Mod} | Left], State) ->
     init(Left, State#state{call_back_mod = Mod});
