@@ -13,8 +13,8 @@
 
 -export([
          start_link/2, %% 开始进程池
-         workers/1, %% 所有工作进程
-         check_in/2, %% 回收一条工作进程
+         get_workers/1, %% 所有工作进程
+         check_in/1, %% 回收一条工作进程
          check_out/1, %% 获取一条工作进程
          stop/1 %% 停止进程池
         ]).
@@ -43,6 +43,7 @@
 
 -record(check_outed,
         {pid = undefined, % 工作进程id
+         from_pid = undefined, % 使用的进程pid
          from = undefined, % 使用的进程信息
          monitor = undefined %% 监控进程
         }). 
@@ -74,10 +75,10 @@ check_out(Name) ->
             erlang:raise(Class, Reason, erlang:get_stacktrace())
     end.
 
-check_in(Name, Pid) ->
-    gen_server:cast(Name, {check_in, Pid}).
+check_in(Name) ->
+    gen_server:cast(Name, {check_in, self()}).
 
-workers(Name) ->
+get_workers(Name) ->
     ets:lookup_element(?ETS_BADPOOL, {workers, Name}, 2).
 
 stop(Name) ->
@@ -97,13 +98,13 @@ init({SupOpts, WorkerOpts}) ->
 handle_call({check_out}, {FromPid, _} = From, State) ->
     #state{name = Name, monitors = Monitors, waiting = Waiting} = State,
     Monitor = monitor(process, FromPid),
-    case workers(Name) of
+    case get_workers(Name) of
         [] ->
             NewWaiting = queue:in({From, Monitor}, Waiting),
             {noreply, State#state{waiting = NewWaiting}};
         [Pid | Left] ->
             ets:insert(?ETS_BADPOOL, {{workers, Name}, Left}),
-            {reply, Pid, State#state{monitors = [{Pid, From, Monitor} | Monitors]}}
+            {reply, Pid, State#state{monitors = [{Pid, FromPid, From, Monitor} | Monitors]}}
     end;
 handle_call(_Request, _From, State) ->
     io:format("request ~p, from ~p~n", [_Request, _From]),
@@ -127,7 +128,7 @@ handle_info(Request, State) ->
 
 terminate(_Reason, State) ->
     #state{name = Name, monitors = Monitors, waiting = Waiting} = State,
-    Workers = workers(Name),
+    Workers = get_workers(Name),
     stop_wait(Waiting),
     [exit(Pid) || {Pid, _} <- Workers],
     [exit(MPid) || {MPid, _, _} <- Monitors],
@@ -142,22 +143,22 @@ code_change(_Ovsn, State, _Extra) ->
 add_worker(Pid, State) ->
     #state{name = Name, waiting = Waiting, monitors = Monitors} = State,
     case queue:out(Waiting) of
-        {{value, #wait{from = From, monitor = WaitMonitor}}, Left} ->
-            NewCheckout = #check_outed{pid = Pid, from = From, monitor = WaitMonitor},
+        {{value, #wait{from = {FromPid, _} = From, monitor = WaitMonitor}}, Left} ->
+            NewCheckout = {Pid, FromPid, From, WaitMonitor},
             gen_server:reply(From, Pid),
             {ok, State#state{waiting = Left, monitors = [NewCheckout | Monitors]}};
         {empty, _} ->
-            Workers = workers(Name),
+            Workers = get_workers(Name),
             ets:insert(?ETS_BADPOOL, {{workers, Name}, [Pid | Workers]}),
             {ok, State}
     end.
 
 do_handle_cast({check_in, Pid}, State) ->
     #state{monitors = Monitors} = State,
-    case lists:keytake(Pid, 1, Monitors) of
-        {value, #check_outed{pid = Pid, monitor = Monitor}, LeftMonitors} ->
+    case lists:keytake(Pid, 2, Monitors) of
+        {value, {pid = WorkPid, Pid, _,  monitor = Monitor}, LeftMonitors} ->
             demonitor(Monitor),
-            add_worker(Pid, State#state{monitors = LeftMonitors});
+            add_worker(WorkPid, State#state{monitors = LeftMonitors});
         false ->
             io:format("not find monitor~n"),
             {ok, State}
@@ -180,7 +181,7 @@ do_handle_cast(_Request, State) ->
 % link的进程死掉，也就是工作进程死了，需要重新开一个新的工作进程
 do_handle_info({'EXIT', {Pid, _} = From, Reason}, State) ->
     #state{monitors = Monitors, sup_pid = SupPid} = State,
-    case lists:keytake(From, #check_outed.pid, Monitors) of
+    case lists:keytake(From, 3, Monitors) of
         {value, #check_outed{pid = Pid, monitor = Monitor}, LeftMonitors} ->
             demonitor(Monitor),
             {ok, NewWorkerPid} = supervisor:start_link(SupPid, []),
@@ -199,17 +200,17 @@ do_handle_info(_Request, State) ->
 
 do_check_in(Pid, State) when is_pid(Pid) ->
     #state{monitors = Monitors} = State,
-    case lists:keytake(Pid, 1, Monitors) of
-        {value, {Pid, _From, Monitor}, LeftMonitors} ->
+    case lists:keytake(Pid, 2, Monitors) of
+        {value, {WorkPid, Pid, _From, Monitor}, LeftMonitors} ->
             demonitor(Monitor),
-            add_worker(Pid, State#state{monitors = LeftMonitors});
+            add_worker(WorkPid, State#state{monitors = LeftMonitors});
         false ->
             io:format("not find monitor"),
             {ok, State}
     end;
 do_check_in(From, State) ->
     #state{monitors = Monitors} = State,
-    case lists:keytake(From, #check_outed.from, Monitors) of
+    case lists:keytake(From, 3, Monitors) of
         {value, #check_outed{pid = Pid}, _LeftMonitors} ->
             do_check_in(Pid, State);
         false ->
